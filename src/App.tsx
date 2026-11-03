@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState, type ChangeEvent, type FormEvent, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent, type ReactNode } from 'react'
 import mammoth from 'mammoth'
+import JSZip from 'jszip'
 import {
   ArrowLeft, ArrowRight, Bell, BookOpen, BookPlus, Check, ChevronDown, ChevronRight,
   Clapperboard, Clock3, Cloud, Command, FileImage, FileText, ImagePlus, Layers3,
@@ -85,6 +86,7 @@ export default function App() {
   const [modelPulling, setModelPulling] = useState(false)
   const [setupProgress, setSetupProgress] = useState('')
   const [importBusy, setImportBusy] = useState(false)
+  const uploadInputRef = useRef<HTMLInputElement>(null)
   const [storyTitle, setStoryTitle] = useState('')
   const [storySynopsis, setStorySynopsis] = useState('')
   const [characterName, setCharacterName] = useState('')
@@ -108,6 +110,7 @@ export default function App() {
   const currentTitle = page === 'Overview' ? 'Your creative desk' : page
 
   function go(next: Page) { setPage(next); setMobileNav(false); setNotice('') }
+  function openUploadPicker() { uploadInputRef.current?.click() }
   function resetModal() {
     setModal(null); setStoryTitle(''); setStorySynopsis(''); setCharacterName(''); setCharacterRole('Main character')
     setCharacterDescription(''); setStyleName(''); setStyleNotes(''); setStyleFile(null); setSceneTitle(''); setSceneDescription('')
@@ -122,15 +125,62 @@ export default function App() {
     const files = Array.from(event.target.files ?? [])
     event.target.value = ''
     if (!files.length) return
-    const novelFile = files.find((file) => /\.(docx|txt|md)$/i.test(file.name))
+
+    // A ZIP can contain the novel document and one or more art-reference images.
+    const archiveFile = files.find((file) => /\.zip$/i.test(file.name))
+    const documentFile = files.find((file) => /\.(docx|txt|md)$/i.test(file.name))
+    const novelFile = archiveFile ?? documentFile
     const separateImage = files.find((file) => file.type.startsWith('image/'))
-    if (!novelFile) { setNotice('Choose one DOCX, TXT, or Markdown novel. You can select an art reference image at the same time.'); return }
+    if (!novelFile) {
+      setAiError('Pilih file ZIP berisi novel, dokumen DOCX/TXT/MD, atau dokumen bersama gambar referensi.')
+      setNotice('File belum dipilih dengan format yang didukung.')
+      return
+    }
+
     setImportBusy(true)
     setAiError('')
+    setNotice('Membaca file dan menyiapkan project…')
     try {
       let content = ''
       let embeddedImages: string[] = []
-      if (/\.docx$/i.test(novelFile.name)) {
+      let archiveImage = ''
+      let storyFileName = novelFile.name
+
+      if (/\.zip$/i.test(novelFile.name)) {
+        const archive = await JSZip.loadAsync(novelFile)
+        const entries = Object.values(archive.files).filter((entry) => !entry.dir)
+        const storyEntry =
+          entries.find((entry) => /\.docx$/i.test(entry.name)) ??
+          entries.find((entry) => /\.txt$/i.test(entry.name)) ??
+          entries.find((entry) => /\.md$/i.test(entry.name))
+        if (!storyEntry) throw new Error('ZIP belum berisi dokumen DOCX, TXT, atau MD. Masukkan novel ke ZIP lalu coba lagi.')
+        storyFileName = storyEntry.name
+
+        const imageEntry = entries.find((entry) => /\.(png|jpe?g|webp|gif)$/i.test(entry.name))
+        if (imageEntry) {
+          const extension = imageEntry.name.split('.').pop()?.toLowerCase() ?? 'png'
+          const mime = extension === 'jpg' || extension === 'jpeg' ? 'image/jpeg' :
+            extension === 'webp' ? 'image/webp' : extension === 'gif' ? 'image/gif' : 'image/png'
+          archiveImage = 'data:' + mime + ';base64,' + await imageEntry.async('base64')
+        }
+
+        if (/\.docx$/i.test(storyEntry.name)) {
+          const arrayBuffer = await storyEntry.async('arraybuffer')
+          const raw = await mammoth.extractRawText({ arrayBuffer })
+          content = raw.value
+          const html = await mammoth.convertToHtml({ arrayBuffer }, {
+            convertImage: mammoth.images.imgElement(async (image) => ({
+              src: 'data:' + image.contentType + ';base64,' + await image.read('base64'),
+            })),
+          })
+          const parsedHtml = new DOMParser().parseFromString(html.value, 'text/html')
+          embeddedImages = Array.from(parsedHtml.querySelectorAll('img'))
+            .map((image) => image.getAttribute('src') ?? '')
+            .filter((src) => src.startsWith('data:image/'))
+        } else {
+          content = await storyEntry.async('string')
+        }
+      } else if (/\.docx$/i.test(novelFile.name)) {
         const arrayBuffer = await novelFile.arrayBuffer()
         const raw = await mammoth.extractRawText({ arrayBuffer })
         content = raw.value
@@ -140,26 +190,50 @@ export default function App() {
           })),
         })
         const parsedHtml = new DOMParser().parseFromString(html.value, 'text/html')
-        embeddedImages = Array.from(parsedHtml.querySelectorAll('img')).map((image) => image.getAttribute('src') ?? '').filter((src) => src.startsWith('data:image/'))
+        embeddedImages = Array.from(parsedHtml.querySelectorAll('img'))
+          .map((image) => image.getAttribute('src') ?? '')
+          .filter((src) => src.startsWith('data:image/'))
       } else {
         content = await novelFile.text()
       }
-      if (!content.trim()) throw new Error('No readable story text was found in that document.')
-      const referenceImageRaw = separateImage ? await fileAsDataUrl(separateImage) : embeddedImages[0] ?? ''
+
+      if (!content.trim()) throw new Error('Dokumen tidak berisi teks cerita yang bisa dibaca.')
+      const referenceImageRaw = separateImage
+        ? await fileAsDataUrl(separateImage)
+        : archiveImage || embeddedImages[0] || ''
       const referenceImage = referenceImageRaw ? await optimizeImageDataUrl(referenceImageRaw) : ''
-      const title = novelFile.name.replace(/\.(docx|txt|md)$/i, '').replace(/[_-]/g, ' ')
-      const story: Story = { id: makeId(), title: title || 'Untitled story', synopsis: 'Imported — automatic project setup is ready to run.', content, createdAt: new Date().toISOString() }
+      const title = storyFileName.split('/').pop()!.replace(/\.(docx|txt|md)$/i, '').replace(/[_-]/g, ' ')
+      const story: Story = {
+        id: makeId(),
+        title: title || 'Untitled story',
+        synopsis: 'Imported — automatic project setup is ready to run.',
+        content,
+        createdAt: new Date().toISOString(),
+      }
       const styleId = makeId()
-      const pending: PendingAutoBuild = { story, referenceImage, referenceName: separateImage?.name ?? (embeddedImages.length ? 'Image embedded in ' + novelFile.name : ''), styleId }
+      const referenceName = separateImage?.name ??
+        (archiveImage ? 'Art reference from ' + novelFile.name : embeddedImages.length ? 'Image embedded in ' + storyFileName : '')
+      const pending: PendingAutoBuild = { story, referenceImage, referenceName, styleId }
+
+      // Save the imported novel before trying to connect the optional local AI.
       setStories((current) => [story, ...current])
       setSelectedStoryId(story.id)
       setPendingAutoBuild(pending)
       setAiAnalysis(null)
       if (referenceImage) {
-        setStyles((current) => [{ id: styleId, name: 'Visual direction — ' + story.title, notes: 'Reference imported. Local vision analysis will describe its linework, palette, shading, and mood.', fileName: pending.referenceName, preview: referenceImage }, ...current])
+        setStyles((current) => [{
+          id: styleId,
+          name: 'Visual direction — ' + story.title,
+          notes: 'Reference imported. Local vision analysis will describe its linework, palette, shading, and mood.',
+          fileName: referenceName,
+          preview: referenceImage,
+        }, ...current])
       }
       setPage('AI Studio')
-      setNotice(referenceImage ? 'Document and art reference imported. Preparing automatic project mapping…' : 'Document imported. Preparing automatic story mapping…')
+      setNotice(referenceImage
+        ? 'Novel and art reference imported. Preparing automatic project mapping…'
+        : 'Novel imported. Preparing automatic story mapping…')
+
       try {
         const response = await fetch('/ollama/api/tags')
         if (!response.ok) throw new Error('Ollama returned HTTP ' + response.status)
@@ -169,20 +243,20 @@ export default function App() {
         setAiStatus('connected')
         const model = referenceImage ? models.find(isVisionModel) : models[0]
         if (!models.length) {
-          setAiError('Dokumen sudah masuk. Ollama aktif, tetapi belum ada model terpasang. Klik “Install AI engine” satu kali untuk memasang model lokal.')
+          setAiError('Novel sudah tersimpan. Ollama aktif, tetapi model belum terpasang. Buka AI Studio dan klik Install AI engine.')
         } else if (referenceImage && !model) {
-          setAiError('Dokumen dan foto sudah masuk. Agar AI bisa membaca gambar referensi, pasang model vision satu kali dengan tombol “Install AI engine”.')
+          setAiError('Novel dan gambar sudah tersimpan. Pasang model vision melalui tombol Install AI engine agar AI bisa membaca referensi.')
         } else {
           setSelectedAiModel(model ?? models[0])
           await runAutoBuild(pending, model ?? models[0])
         }
       } catch (error) {
         setAiStatus('offline')
-        setAiError('Dokumen sudah masuk, tetapi Ollama belum bisa dihubungi. Buka aplikasi Ollama, lalu tekan Check connection. ' + (error instanceof Error ? error.message : ''))
+        setAiError('Novel sudah tersimpan, tetapi AI lokal belum terhubung. Buka Ollama lalu klik Check connection di AI Studio. ' + (error instanceof Error ? error.message : ''))
       }
     } catch (error) {
       setAiError('Import gagal: ' + (error instanceof Error ? error.message : 'Unknown error'))
-      setNotice('File belum berhasil diproses.')
+      setNotice('File belum berhasil diproses. Periksa format file lalu coba lagi.')
     } finally {
       setImportBusy(false)
     }
@@ -437,6 +511,7 @@ export default function App() {
   }
 
   return <div className="app-shell">
+    <input ref={uploadInputRef} className="global-upload-input" type="file" accept=".zip,.docx,.txt,.md,image/*" multiple onChange={importNovel} aria-label="Upload a novel and art reference" />
     <aside className={'sidebar ' + (mobileNav ? 'sidebar-open' : '')}>
       <div className="brand-lockup"><div className="brand-mark"><span>M</span><i /></div><div><div className="brand-name">manhwa<span>studio</span></div><div className="brand-caption">YOUR PERSONAL STORY LAB</div></div><button className="icon-button sidebar-close" onClick={() => setMobileNav(false)} aria-label="Close menu"><X size={18} /></button></div>
       <div className="workspace-switcher"><div className="workspace-avatar">V</div><div className="workspace-copy"><strong>My workspace</strong><span>Personal studio</span></div><ChevronDown size={15} className="muted-icon" /></div>
@@ -450,8 +525,8 @@ export default function App() {
         {notice && <div className="notice-bar"><Check size={15} /><span>{notice}</span><button onClick={() => setNotice('')} aria-label="Dismiss notice"><X size={15} /></button></div>}
 
         {page === 'Overview' && <section>
-          <div className="page-heading"><div><div className="eyebrow"><Sparkles size={13} /> THE CREATOR'S WORKSPACE</div><h1>Make your story <span>seen.</span></h1><p>Everything you need to shape a novel into a world of panels.</p></div><button className="primary-button" onClick={() => setModal('story')}><Plus size={17} /> New story</button></div>
-          <div className="hero-card"><div className="hero-copy"><div className="hero-kicker"><span className="kicker-line" /> YOUR NEXT CHAPTER STARTS HERE</div><h2>From the first word<br />to the <em>final panel.</em></h2><p>A quiet space to build characters, define your art direction, and bring every scene to life — one step at a time.</p><div className="hero-actions"><button className="hero-button" onClick={() => setModal('story')}>Start creating <ArrowRight size={16} /></button><button className="text-button" onClick={() => go('My Stories')}>Explore workspace</button></div></div><div className="hero-art" aria-hidden="true"><div className="orbit orbit-one" /><div className="orbit orbit-two" /><div className="art-spark spark-a">✳</div><div className="art-spark spark-b">✦</div><div className="hero-sheet sheet-back"><span>CHAPTER 01</span><i /><i /><i /></div><div className="hero-sheet sheet-front"><div className="sheet-top"><span>STORY / 001</span><span>✳</span></div><div className="sheet-illustration"><div className="silhouette-head" /><div className="silhouette-body" /><div className="silhouette-shine" /></div><div className="sheet-lines"><i /><i /><i /></div></div><div className="floating-tag tag-top"><Sparkles size={13} /> STORY TO PANEL</div><div className="floating-tag tag-bottom"><span className="tiny-pink-dot" /> YOUR WORLD, YOUR RULES</div></div><div className="hero-grain" /></div>
+          <div className="page-heading"><div><div className="eyebrow"><Sparkles size={13} /> THE CREATOR'S WORKSPACE</div><h1>Make your story <span>seen.</span></h1><p>Everything you need to shape a novel into a world of panels.</p></div><div className="overview-heading-actions"><button className="outline-button" onClick={() => setModal('story')}><Plus size={16} /> New story</button><button className="primary-button" onClick={openUploadPicker} disabled={importBusy}>{importBusy ? <LoaderCircle size={16} className="spin" /> : <Upload size={16} />}{importBusy ? 'Importing…' : 'Upload novel'}</button></div></div>
+          <div className="hero-card"><div className="hero-copy"><div className="hero-kicker"><span className="kicker-line" /> YOUR NEXT CHAPTER STARTS HERE</div><h2>From the first word<br />to the <em>final panel.</em></h2><p>A quiet space to build characters, define your art direction, and bring every scene to life — one step at a time.</p><div className="hero-actions"><button className="hero-button" onClick={openUploadPicker}><Upload size={15} /> Upload novel + art reference</button><button className="text-button" onClick={() => go('My Stories')}>Explore workspace</button></div></div><div className="hero-art" aria-hidden="true"><div className="orbit orbit-one" /><div className="orbit orbit-two" /><div className="art-spark spark-a">✳</div><div className="art-spark spark-b">✦</div><div className="hero-sheet sheet-back"><span>CHAPTER 01</span><i /><i /><i /></div><div className="hero-sheet sheet-front"><div className="sheet-top"><span>STORY / 001</span><span>✳</span></div><div className="sheet-illustration"><div className="silhouette-head" /><div className="silhouette-body" /><div className="silhouette-shine" /></div><div className="sheet-lines"><i /><i /><i /></div></div><div className="floating-tag tag-top"><Sparkles size={13} /> STORY TO PANEL</div><div className="floating-tag tag-bottom"><span className="tiny-pink-dot" /> YOUR WORLD, YOUR RULES</div></div><div className="hero-grain" /></div>
           <div className="section-heading"><div><h3>Your studio at a glance</h3><p>A little progress adds up to a whole new world.</p></div><span className="subtle-label">ALL WORKSPACES</span></div>
           <div className="stats-grid"><StatCard icon={BookOpen} label="Stories" value={stories.length.toString().padStart(2, '0')} detail={wordCount.toLocaleString() + ' words in your library'} /><StatCard icon={Layers3} label="Characters" value={characters.length.toString().padStart(2, '0')} detail="In your character bible" /><StatCard icon={ImagePlus} label="Art references" value={styles.length.toString().padStart(2, '0')} detail="Visual direction saved" /><StatCard icon={Clapperboard} label="Scene drafts" value={scenes.length.toString().padStart(2, '0')} detail="Ready to be shaped" /></div>
           <div className="lower-grid"><div className="panel-card"><div className="card-heading"><div><h3>Recent stories</h3><p>Pick up where your imagination left off.</p></div><button className="subtle-action" onClick={() => go('My Stories')}>View all <ArrowRight size={14} /></button></div>{stories.length ? stories.slice(0, 3).map((story) => <StoryRow key={story.id} story={story} onClick={() => { setSelectedStoryId(story.id); go('My Stories') }} />) : <EmptyInline icon={BookOpen} title="Your bookshelf is waiting" text="Import a novel or create a new story to begin." action="Add your first story" onClick={() => setModal('story')} />}</div>
@@ -460,8 +535,8 @@ export default function App() {
         </section>}
 
         {page === 'My Stories' && <section className="workspace-page">
-          <PageIntro eyebrow="YOUR LIBRARY" title="My stories" description="Every great manhwa begins with a story worth telling." action={<button className="primary-button" onClick={() => setModal('story')}><Plus size={17} /> New story</button>} />
-          <div className="import-banner auto-import-banner"><div className="import-icon"><WandSparkles size={19} /></div><div className="import-copy"><strong>One upload. Your project, mapped automatically.</strong><span>Choose a DOCX with an embedded art reference, or select a novel and image together. AI builds the story map, character bible, art direction, and storyboard.</span></div><label className={'primary-button auto-import-button ' + (importBusy ? 'is-loading' : '')}>{importBusy ? <LoaderCircle size={15} className="spin" /> : <Upload size={15} />}{importBusy ? 'Importing…' : 'Upload & auto-build'}<input type="file" accept=".docx,.txt,.md,image/*" multiple onChange={importNovel} hidden disabled={importBusy} /></label></div>
+          <PageIntro eyebrow="YOUR LIBRARY" title="My stories" description="Import a novel or a ZIP bundle. AI will organize the project for you." action={<div className="overview-heading-actions"><button className="outline-button" onClick={() => setModal('story')}><Plus size={16} /> New story</button><button className="primary-button" onClick={openUploadPicker} disabled={importBusy}><Upload size={16} /> Upload files</button></div>} />
+          <div className="import-banner auto-import-banner"><div className="import-icon"><WandSparkles size={19} /></div><div className="import-copy"><strong>One upload. Your project, mapped automatically.</strong><span>Upload a ZIP containing your novel and art reference, a DOCX with embedded images, or select a novel and image together. AI organizes the project automatically.</span></div><button className="primary-button auto-import-button" onClick={openUploadPicker} disabled={importBusy}>{importBusy ? <LoaderCircle size={15} className="spin" /> : <Upload size={15} />}{importBusy ? 'Importing…' : 'Choose files / ZIP'}</button></div>
           {filteredStories.length ? <div className="story-grid">{filteredStories.map((story, index) => <button className="story-card" key={story.id} onClick={() => { setSelectedStoryId(story.id); setNotice('Selected ' + story.title + '.') }}><div className={'story-cover cover-' + (index % 4)}><span className="cover-index">STORY / {String(index + 1).padStart(3, '0')}</span><div className="cover-orbit" /><div className="cover-glyph">✳</div><span className="cover-bottom">MANHWA STUDIO</span></div><div className="story-card-info"><div><h3>{story.title}</h3><p>{story.synopsis || 'No synopsis yet.'}</p></div><MoreHorizontal size={17} className="muted-icon" /></div><div className="story-card-meta"><span><FileText size={13} /> {story.content ? story.content.trim().split(/\s+/).length.toLocaleString() + ' words' : 'Blank story'}</span><span><Clock3 size={13} /> {new Date(story.createdAt).toLocaleDateString()}</span></div></button>)}</div> : <EmptyState icon={BookOpen} title={searchQuery ? 'No stories found' : 'A blank page is full of possibility'} text={searchQuery ? 'Try a different title or clear your search.' : 'Create a story from scratch or import your novel to make this space yours.'} actionLabel={searchQuery ? 'Clear search' : 'Create your first story'} onAction={() => searchQuery ? setSearchQuery('') : setModal('story')} />}
           {selectedStory && <div className="selected-story-panel"><div className="selected-story-top"><div><div className="eyebrow">CURRENTLY SELECTED</div><h3>{selectedStory.title}</h3></div><span className="status-badge"><span /> IN YOUR WORKSPACE</span></div><p>{selectedStory.synopsis || 'Add a synopsis when you are ready. Your original text is stored locally in this browser.'}</p><div className="selected-story-actions"><button className="outline-button" onClick={() => go('Storyboard')}>Open storyboard <ArrowRight size={14} /></button><button className="text-button danger-text" onClick={() => { if (window.confirm('Delete this story and its local draft?')) { setStories((items) => items.filter((item) => item.id !== selectedStory.id)); setScenes((items) => items.filter((item) => item.storyId !== selectedStory.id)); setNotice('Story deleted from this browser.') } }}>Delete story</button></div></div>}
         </section>}

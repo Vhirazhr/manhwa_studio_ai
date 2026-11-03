@@ -86,3 +86,11 @@ button:disabled{opacity:.48;cursor:not-allowed;transform:none!important;box-shad
 .ai-auto-saved{display:inline-flex;align-items:center;gap:4px;color:#ff9fc2;font-size:7px;font-weight:700;letter-spacing:.55px;white-space:nowrap}
 .ai-model-hint{margin-top:10px!important;color:#ffc1d8!important}
 @media(max-width:700px){.auto-import-banner{align-items:flex-start;flex-wrap:wrap}.auto-import-button{margin-left:51px}.ai-header-actions{justify-content:flex-start}}
+
+
+/* Reliable global upload picker and ZIP import entry points */
+.global-upload-input{position:fixed!important;width:1px!important;height:1px!important;left:-10000px!important;top:auto!important;opacity:0!important;pointer-events:none!important}
+.overview-heading-actions{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.auto-import-banner .auto-import-button{display:inline-flex;align-items:center;justify-content:center;gap:8px}
+.auto-import-button:disabled,.overview-heading-actions button:disabled{opacity:.55;cursor:wait}
+@media(max-width:620px){.overview-heading-actions{width:100%;justify-content:flex-start}.page-heading{align-items:flex-start;flex-direction:column}.auto-import-banner{align-items:flex-start;flex-wrap:wrap}}
