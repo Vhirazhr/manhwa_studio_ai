@@ -300,7 +300,10 @@ export default function App() {
     setAiError('')
     try {
       const response = await fetch('/ollama/api/tags')
-      if (!response.ok) throw new Error('Ollama returned HTTP ' + response.status)
+      if (!response.ok) {
+        const detail = (await response.text()).trim()
+        throw new Error('HTTP ' + response.status + (detail ? ': ' + detail.slice(0, 700) : ''))
+      }
       const data = await response.json() as { models?: { name?: string; model?: string }[] }
       const models = (data.models ?? []).map((item) => item.name ?? item.model ?? '').filter(Boolean)
       setAiModels(models)
@@ -317,7 +320,8 @@ export default function App() {
     } catch (error) {
       setAiModels([])
       setAiStatus('offline')
-      setAiError('Tidak dapat menghubungi Ollama di 127.0.0.1:11434. Buka aplikasi Ollama lalu coba lagi. ' + (error instanceof Error ? error.message : ''))
+      const detail = error instanceof Error ? error.message : String(error)
+      setAiError('Ollama belum merespons dengan benar pada 127.0.0.1:11434. Pastikan aplikasi Ollama berjalan di komputer ini. Detail: ' + detail + ' — Tes di PowerShell: Invoke-RestMethod http://127.0.0.1:11434/api/tags')
     }
   }
 
@@ -409,7 +413,12 @@ export default function App() {
           options: { temperature: 0.25 },
         }),
       })
-      const payload = await response.json() as { message?: { content?: string }; error?: string }
+      const responseText = await response.text()
+      let payload: { message?: { content?: string }; error?: string } = {}
+      try { payload = JSON.parse(responseText) as typeof payload } catch {
+        if (!response.ok) throw new Error('Ollama HTTP ' + response.status + ': ' + responseText.slice(0, 700))
+        throw new Error('Ollama mengirim respons yang bukan JSON: ' + responseText.slice(0, 300))
+      }
       if (!response.ok) throw new Error(payload.error ?? 'Local model request failed with HTTP ' + response.status)
       const raw = (payload.message?.content ?? '').trim()
       if (!raw) throw new Error('Model mengembalikan jawaban kosong. Coba lagi atau gunakan naskah lebih pendek.')
