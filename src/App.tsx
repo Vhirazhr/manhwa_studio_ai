@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState, type ChangeEvent, type FormEvent, type ReactNode } from 'react'
+import mammoth from 'mammoth'
 import {
   ArrowLeft, ArrowRight, Bell, BookOpen, BookPlus, Check, ChevronDown, ChevronRight,
   Clapperboard, Clock3, Cloud, Command, FileImage, FileText, ImagePlus, Layers3,
@@ -8,10 +9,11 @@ import {
 
 type Page = 'Overview' | 'My Stories' | 'Characters' | 'Art Styles' | 'AI Studio' | 'Storyboard' | 'Panel Editor'
 type Story = { id: string; title: string; synopsis: string; content: string; createdAt: string }
+type PendingAutoBuild = { story: Story; referenceImage: string; referenceName: string; styleId: string }
 type Character = { id: string; name: string; role: string; description: string; storyId: string }
 type ArtStyle = { id: string; name: string; notes: string; fileName: string; preview?: string }
 type Scene = { id: string; title: string; description: string; storyId: string; status: 'Draft' | 'Ready' }
-type AIAnalysis = { storyId: string; genre: string; logline: string; synopsis: string; themes: string[]; characters: { name: string; role: string; description: string }[]; scenes: { title: string; summary: string }[] }
+type AIAnalysis = { storyId: string; genre: string; logline: string; synopsis: string; themes: string[]; artStyleNotes: string; relationships: { from: string; to: string; relation: string }[]; characters: { name: string; role: string; description: string }[]; scenes: { title: string; summary: string }[] }
 type Modal = 'story' | 'character' | 'style' | 'scene' | null
 
 const navItems: { label: Page; icon: LucideIcon; section: string }[] = [
@@ -30,6 +32,33 @@ const starterTips = [
   { icon: Clapperboard, title: 'Shape your first episode', text: 'Turn important moments into storyboard scenes.', page: 'Storyboard' as Page },
 ]
 const makeId = () => Math.random().toString(36).slice(2, 10)
+const isVisionModel = (name: string) => /(qwen.*vl|qwen2\.5vl|qwen3-vl|llava|minicpm-v|moondream|bakllava|gemma3|granite.*vision)/i.test(name)
+async function optimizeImageDataUrl(dataUrl: string): Promise<string> {
+  return new Promise((resolve) => {
+    const image = new Image()
+    image.onload = () => {
+      const maxSide = 900
+      const scale = Math.min(1, maxSide / Math.max(image.width, image.height))
+      const canvas = document.createElement('canvas')
+      canvas.width = Math.max(1, Math.round(image.width * scale))
+      canvas.height = Math.max(1, Math.round(image.height * scale))
+      const context = canvas.getContext('2d')
+      if (!context) { resolve(dataUrl); return }
+      context.drawImage(image, 0, 0, canvas.width, canvas.height)
+      resolve(canvas.toDataURL('image/jpeg', 0.78))
+    }
+    image.onerror = () => resolve(dataUrl)
+    image.src = dataUrl
+  })
+}
+async function fileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result ?? ''))
+    reader.onerror = () => reject(new Error('Could not read the selected reference image.'))
+    reader.readAsDataURL(file)
+  })
+}
 function readStorage<T>(key: string, fallback: T): T {
   try { const value = localStorage.getItem(key); return value ? JSON.parse(value) as T : fallback } catch { return fallback }
 }
@@ -52,6 +81,10 @@ export default function App() {
   const [aiError, setAiError] = useState('')
   const [aiBusy, setAiBusy] = useState(false)
   const [aiAnalysis, setAiAnalysis] = useState<AIAnalysis | null>(null)
+  const [pendingAutoBuild, setPendingAutoBuild] = useState<PendingAutoBuild | null>(null)
+  const [modelPulling, setModelPulling] = useState(false)
+  const [setupProgress, setSetupProgress] = useState('')
+  const [importBusy, setImportBusy] = useState(false)
   const [storyTitle, setStoryTitle] = useState('')
   const [storySynopsis, setStorySynopsis] = useState('')
   const [characterName, setCharacterName] = useState('')
@@ -65,7 +98,7 @@ export default function App() {
 
   useEffect(() => localStorage.setItem('manhwa-stories', JSON.stringify(stories)), [stories])
   useEffect(() => localStorage.setItem('manhwa-characters', JSON.stringify(characters)), [characters])
-  useEffect(() => localStorage.setItem('manhwa-styles', JSON.stringify(styles.map(({ preview, ...item }) => item))), [styles])
+  useEffect(() => localStorage.setItem('manhwa-styles', JSON.stringify(styles)), [styles])
   useEffect(() => localStorage.setItem('manhwa-scenes', JSON.stringify(scenes)), [scenes])
 
   const selectedStory = stories.find((story) => story.id === selectedStoryId) ?? stories[0]
@@ -85,18 +118,74 @@ export default function App() {
     const story = { id: makeId(), title: storyTitle.trim(), synopsis: storySynopsis.trim(), content: '', createdAt: new Date().toISOString() }
     setStories((current) => [story, ...current]); setSelectedStoryId(story.id); setPage('My Stories'); resetModal(); setNotice('Your new story workspace is ready.')
   }
-  function importNovel(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0]
-    if (!file) return
-    if (!/\.(txt|md)$/i.test(file.name)) { setNotice('For this first version, please upload a .txt or .md novel file.'); event.target.value = ''; return }
-    const reader = new FileReader()
-    reader.onload = () => {
-      const title = file.name.replace(/\.(txt|md)$/i, '').replace(/[_-]/g, ' ')
-      const story = { id: makeId(), title: title || 'Untitled story', synopsis: 'Imported from your local device.', content: String(reader.result ?? ''), createdAt: new Date().toISOString() }
-      setStories((current) => [story, ...current]); setSelectedStoryId(story.id); setPage('My Stories'); setNotice('Novel imported and saved in this browser.')
+  async function importNovel(event: ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(event.target.files ?? [])
+    event.target.value = ''
+    if (!files.length) return
+    const novelFile = files.find((file) => /\.(docx|txt|md)$/i.test(file.name))
+    const separateImage = files.find((file) => file.type.startsWith('image/'))
+    if (!novelFile) { setNotice('Choose one DOCX, TXT, or Markdown novel. You can select an art reference image at the same time.'); return }
+    setImportBusy(true)
+    setAiError('')
+    try {
+      let content = ''
+      let embeddedImages: string[] = []
+      if (/\.docx$/i.test(novelFile.name)) {
+        const arrayBuffer = await novelFile.arrayBuffer()
+        const raw = await mammoth.extractRawText({ arrayBuffer })
+        content = raw.value
+        const html = await mammoth.convertToHtml({ arrayBuffer }, {
+          convertImage: mammoth.images.imgElement(async (image) => ({
+            src: 'data:' + image.contentType + ';base64,' + await image.read('base64'),
+          })),
+        })
+        const parsedHtml = new DOMParser().parseFromString(html.value, 'text/html')
+        embeddedImages = Array.from(parsedHtml.querySelectorAll('img')).map((image) => image.getAttribute('src') ?? '').filter((src) => src.startsWith('data:image/'))
+      } else {
+        content = await novelFile.text()
+      }
+      if (!content.trim()) throw new Error('No readable story text was found in that document.')
+      const referenceImageRaw = separateImage ? await fileAsDataUrl(separateImage) : embeddedImages[0] ?? ''
+      const referenceImage = referenceImageRaw ? await optimizeImageDataUrl(referenceImageRaw) : ''
+      const title = novelFile.name.replace(/\.(docx|txt|md)$/i, '').replace(/[_-]/g, ' ')
+      const story: Story = { id: makeId(), title: title || 'Untitled story', synopsis: 'Imported — automatic project setup is ready to run.', content, createdAt: new Date().toISOString() }
+      const styleId = makeId()
+      const pending: PendingAutoBuild = { story, referenceImage, referenceName: separateImage?.name ?? (embeddedImages.length ? 'Image embedded in ' + novelFile.name : ''), styleId }
+      setStories((current) => [story, ...current])
+      setSelectedStoryId(story.id)
+      setPendingAutoBuild(pending)
+      setAiAnalysis(null)
+      if (referenceImage) {
+        setStyles((current) => [{ id: styleId, name: 'Visual direction — ' + story.title, notes: 'Reference imported. Local vision analysis will describe its linework, palette, shading, and mood.', fileName: pending.referenceName, preview: referenceImage }, ...current])
+      }
+      setPage('AI Studio')
+      setNotice(referenceImage ? 'Document and art reference imported. Preparing automatic project mapping…' : 'Document imported. Preparing automatic story mapping…')
+      try {
+        const response = await fetch('/ollama/api/tags')
+        if (!response.ok) throw new Error('Ollama returned HTTP ' + response.status)
+        const data = await response.json() as { models?: { name?: string; model?: string }[] }
+        const models = (data.models ?? []).map((item) => item.name ?? item.model ?? '').filter(Boolean)
+        setAiModels(models)
+        setAiStatus('connected')
+        const model = referenceImage ? models.find(isVisionModel) : models[0]
+        if (!models.length) {
+          setAiError('Dokumen sudah masuk. Ollama aktif, tetapi belum ada model terpasang. Klik “Install AI engine” satu kali untuk memasang model lokal.')
+        } else if (referenceImage && !model) {
+          setAiError('Dokumen dan foto sudah masuk. Agar AI bisa membaca gambar referensi, pasang model vision satu kali dengan tombol “Install AI engine”.')
+        } else {
+          setSelectedAiModel(model ?? models[0])
+          await runAutoBuild(pending, model ?? models[0])
+        }
+      } catch (error) {
+        setAiStatus('offline')
+        setAiError('Dokumen sudah masuk, tetapi Ollama belum bisa dihubungi. Buka aplikasi Ollama, lalu tekan Check connection. ' + (error instanceof Error ? error.message : ''))
+      }
+    } catch (error) {
+      setAiError('Import gagal: ' + (error instanceof Error ? error.message : 'Unknown error'))
+      setNotice('File belum berhasil diproses.')
+    } finally {
+      setImportBusy(false)
     }
-    reader.onerror = () => setNotice('Could not read that file. Try another .txt or .md file.')
-    reader.readAsText(file); event.target.value = ''
   }
   function createCharacter(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -141,41 +230,107 @@ export default function App() {
       const data = await response.json() as { models?: { name?: string; model?: string }[] }
       const models = (data.models ?? []).map((item) => item.name ?? item.model ?? '').filter(Boolean)
       setAiModels(models)
-      setSelectedAiModel((current) => current && models.includes(current) ? current : models[0] ?? '')
       setAiStatus('connected')
-      if (!models.length) setAiError('Ollama is running, but no model is installed yet. Install a small instruct model, then check again.')
+      const model = pendingAutoBuild?.referenceImage ? models.find(isVisionModel) : models[0]
+      if (model) {
+        setSelectedAiModel(model)
+        if (pendingAutoBuild) await runAutoBuild(pendingAutoBuild, model)
+      } else if (pendingAutoBuild?.referenceImage) {
+        setAiError('Ollama sudah aktif, tetapi model vision belum terpasang. Klik “Install AI engine” untuk melanjutkan otomatis.')
+      } else if (!models.length) {
+        setAiError('Ollama aktif, tetapi belum ada model terpasang. Klik “Install AI engine” untuk memasang model lokal.')
+      }
     } catch (error) {
       setAiModels([])
       setAiStatus('offline')
-      setAiError('Cannot reach Ollama at 127.0.0.1:11434. Open the Ollama app first, then click Check connection again. ' + (error instanceof Error ? error.message : ''))
+      setAiError('Tidak dapat menghubungi Ollama di 127.0.0.1:11434. Buka aplikasi Ollama lalu coba lagi. ' + (error instanceof Error ? error.message : ''))
     }
   }
 
-  async function analyzeWithLocalAI() {
-    if (!selectedStory?.content.trim()) { setAiError('Choose a story that contains imported novel text first.'); return }
-    if (!selectedAiModel) { setAiError('Connect Ollama and select an installed model first.'); return }
-    setAiBusy(true)
+  async function installRecommendedModel() {
+    setModelPulling(true)
+    setSetupProgress('Memulai unduhan model vision lokal…')
     setAiError('')
     try {
-      const fullText = selectedStory.content
+      const response = await fetch('/ollama/api/pull', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'qwen2.5vl:3b', stream: true }),
+      })
+      if (!response.ok) {
+        const detail = await response.text()
+        throw new Error(detail || 'Ollama gagal memulai unduhan model.')
+      }
+      const reader = response.body?.getReader()
+      if (!reader) throw new Error('Browser tidak dapat membaca progres unduhan.')
+      const decoder = new TextDecoder()
+      let buffer = ''
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() ?? ''
+        for (const line of lines) {
+          if (!line.trim()) continue
+          const item = JSON.parse(line) as { status?: string; completed?: number; total?: number; error?: string }
+          if (item.error) throw new Error(item.error)
+          const percent = item.total ? ' ' + Math.floor((item.completed ?? 0) / item.total * 100) + '%' : ''
+          setSetupProgress((item.status ?? 'Downloading model') + percent)
+        }
+      }
+      if (buffer.trim()) {
+        const last = JSON.parse(buffer) as { status?: string; error?: string }
+        if (last.error) throw new Error(last.error)
+      }
+      setSetupProgress('Model siap. Menjalankan analisis otomatis…')
+      const tags = await fetch('/ollama/api/tags')
+      const data = await tags.json() as { models?: { name?: string; model?: string }[] }
+      const models = (data.models ?? []).map((item) => item.name ?? item.model ?? '').filter(Boolean)
+      setAiModels(models)
+      setAiStatus('connected')
+      const model = models.find(isVisionModel) ?? 'qwen2.5vl:3b'
+      setSelectedAiModel(model)
+      if (pendingAutoBuild) await runAutoBuild(pendingAutoBuild, model)
+      else setNotice('AI engine lokal berhasil dipasang. Sekarang kamu bisa mengimpor novel dan referensi visual sekaligus.')
+    } catch (error) {
+      setAiError('Setup model gagal: ' + (error instanceof Error ? error.message : 'Unknown error') + ' Pastikan Ollama sudah terbuka.')
+    } finally {
+      setModelPulling(false)
+    }
+  }
+
+  async function runAutoBuild(pending: PendingAutoBuild, model: string) {
+    if (pending.referenceImage && !isVisionModel(model)) {
+      setAiError('Model yang dipilih belum mendukung gambar. Gunakan model vision seperti qwen2.5vl:3b.')
+      return
+    }
+    setAiBusy(true)
+    setAiError('')
+    setSetupProgress('AI sedang membaca cerita' + (pending.referenceImage ? ' dan referensi visual' : '') + '…')
+    try {
+      const fullText = pending.story.content
       const excerpt = fullText.length > 24000
-        ? fullText.slice(0, 16000) + '\n\n[Some middle text is omitted to fit the local model context.]\n\n' + fullText.slice(-8000)
+        ? fullText.slice(0, 16000) + '\n\n[Bagian tengah naskah dipersingkat pada versi awal.]\n\n' + fullText.slice(-8000)
         : fullText
-      const prompt = 'Novel title: ' + selectedStory.title + '\n\n' +
-        'Analyze the following novel text for a manhwa adaptation. The text may be an excerpt if it is marked as omitted. Do not claim to know events outside the provided text.\n\n' +
-        'Return ONLY valid JSON with this exact shape: ' +
-        '{"genre":"string","logline":"one sentence","synopsis":"short synopsis","themes":["theme"],"characters":[{"name":"character name","role":"story role","description":"appearance, personality, motivation, and evidence from the text"}],"scenes":[{"title":"short scene title","summary":"what happens and the emotional beat"}]}. ' +
-        'Use Indonesian. Include up to 10 important characters and up to 10 scenes. Only include details supported by the text. If a detail is uncertain, say so briefly rather than inventing it.\n\n' + excerpt
+      const prompt = 'Judul novel: ' + pending.story.title + '\n\n' +
+        'Tugasmu adalah menyiapkan project adaptasi manhwa secara otomatis. Baca naskah, petakan genre, logline, sinopsis, tema, semua tokoh penting, hubungan antartokoh, dan adegan utama untuk storyboard. ' +
+        (pending.referenceImage ? 'Gambar yang dilampirkan adalah REFERENSI ART STYLE. Analisis hanya gaya visualnya: line art, palet warna, shading, pencahayaan, ekspresi, dan mood. Jangan menyalin tokoh atau komposisi gambar. ' : '') +
+        'Jangan meminta prompt tambahan. Gunakan bahasa Indonesia. Jangan mengarang detail yang tidak didukung teks. Keluarkan hanya JSON valid dengan bentuk: ' +
+        '{"genre":"string","logline":"string","synopsis":"string","themes":["string"],"artStyleNotes":"string","relationships":[{"from":"nama tokoh","to":"nama tokoh","relation":"jenis hubungan"}],"characters":[{"name":"nama","role":"peran","description":"penampilan, kepribadian, motivasi, dan bukti dari cerita"}],"scenes":[{"title":"judul adegan","summary":"peristiwa, emosi, dan arahan visual singkat"}]}. ' +
+        'Maksimal 15 tokoh dan 20 adegan. Jika naskah terlalu panjang atau ada informasi yang belum jelas, tandai keterbatasannya daripada menebak.\n\n' + excerpt
+      const userMessage: { role: 'user'; content: string; images?: string[] } = { role: 'user', content: prompt }
+      if (pending.referenceImage) userMessage.images = [pending.referenceImage.split(',')[1] ?? pending.referenceImage]
       const response = await fetch('/ollama/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: selectedAiModel,
+          model,
           stream: false,
           format: 'json',
           messages: [
-            { role: 'system', content: 'Anda adalah editor naskah dan analis cerita untuk adaptasi manhwa. Analisis hanya berdasarkan teks yang diberikan. Jangan mengarang tokoh, hubungan, latar, atau peristiwa. Balas hanya JSON valid sesuai struktur yang diminta.' },
-            { role: 'user', content: prompt },
+            { role: 'system', content: 'Anda adalah editor cerita, story analyst, character designer, dan sutradara storyboard untuk adaptasi manhwa. Kerjakan pemetaan secara mandiri berdasarkan naskah dan referensi visual. Jangan meminta user menulis prompt. Jangan mengarang fakta cerita.' },
+            userMessage,
           ],
           options: { temperature: 0.25 },
         }),
@@ -183,32 +338,72 @@ export default function App() {
       const payload = await response.json() as { message?: { content?: string }; error?: string }
       if (!response.ok) throw new Error(payload.error ?? 'Local model request failed with HTTP ' + response.status)
       const raw = (payload.message?.content ?? '').trim()
-      if (!raw) throw new Error('The local model returned an empty response. Try another model or a shorter novel.')
-      const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '')
+      if (!raw) throw new Error('Model mengembalikan jawaban kosong. Coba lagi atau gunakan naskah lebih pendek.')
+      const cleaned = raw.replace(/^\`\`\`(?:json)?\s*/i, '').replace(/\s*\`\`\`$/, '')
       const parsed = JSON.parse(cleaned) as Partial<AIAnalysis>
       const normalized: AIAnalysis = {
-        storyId: selectedStory.id,
+        storyId: pending.story.id,
         genre: typeof parsed.genre === 'string' ? parsed.genre : 'Belum teridentifikasi',
         logline: typeof parsed.logline === 'string' ? parsed.logline : '',
         synopsis: typeof parsed.synopsis === 'string' ? parsed.synopsis : '',
-        themes: Array.isArray(parsed.themes) ? parsed.themes.filter((item): item is string => typeof item === 'string').slice(0, 8) : [],
+        themes: Array.isArray(parsed.themes) ? parsed.themes.filter((item): item is string => typeof item === 'string').slice(0, 10) : [],
+        artStyleNotes: typeof parsed.artStyleNotes === 'string' ? parsed.artStyleNotes : '',
+        relationships: Array.isArray(parsed.relationships) ? parsed.relationships.map((item) => ({
+          from: typeof item.from === 'string' ? item.from : '',
+          to: typeof item.to === 'string' ? item.to : '',
+          relation: typeof item.relation === 'string' ? item.relation : '',
+        })).filter((item) => item.from && item.to).slice(0, 20) : [],
         characters: Array.isArray(parsed.characters) ? parsed.characters.map((item) => ({
           name: typeof item.name === 'string' ? item.name.trim() : '',
           role: typeof item.role === 'string' ? item.role : 'Belum ditentukan',
           description: typeof item.description === 'string' ? item.description : '',
-        })).filter((item) => item.name).slice(0, 10) : [],
+        })).filter((item) => item.name).slice(0, 15) : [],
         scenes: Array.isArray(parsed.scenes) ? parsed.scenes.map((item) => ({
           title: typeof item.title === 'string' ? item.title : 'Adegan tanpa judul',
           summary: typeof item.summary === 'string' ? item.summary : '',
-        })).filter((item) => item.title).slice(0, 10) : [],
+        })).filter((item) => item.title).slice(0, 20) : [],
       }
       setAiAnalysis(normalized)
-      if (fullText.length > 24000) setAiError('Catatan: novel cukup panjang, jadi analisis memakai bagian awal dan akhir. Untuk analisis menyeluruh per bab, kita akan menambahkan pemrosesan bertahap.')
+      setStories((current) => current.map((story) => story.id === pending.story.id ? { ...story, synopsis: normalized.synopsis || story.synopsis } : story))
+      setCharacters((current) => {
+        const existing = new Set(current.filter((character) => character.storyId === pending.story.id).map((character) => character.name.toLowerCase()))
+        const additions = normalized.characters.filter((character) => !existing.has(character.name.toLowerCase())).map((character) => ({
+          id: makeId(), name: character.name, role: character.role, description: character.description, storyId: pending.story.id,
+        }))
+        return [...additions, ...current]
+      })
+      const generatedScenes = normalized.scenes.map((scene) => ({
+        id: makeId(), title: scene.title, description: scene.summary, storyId: pending.story.id, status: 'Draft' as const,
+      }))
+      setScenes((current) => [...generatedScenes, ...current])
+      if (pending.referenceImage) {
+        setStyles((current) => current.map((style) => style.id === pending.styleId
+          ? { ...style, notes: normalized.artStyleNotes || style.notes }
+          : style))
+      }
+      setPendingAutoBuild(null)
+      setSelectedStoryId(pending.story.id)
+      setPage('AI Studio')
+      setNotice('Project otomatis selesai: sinopsis, Character Bible, referensi art style, dan ' + generatedScenes.length + ' scene storyboard sudah dibuat.')
+      setSetupProgress('Project siap. Semua hasil sudah disimpan ke workspace.')
     } catch (error) {
-      setAiError('Analisis gagal: ' + (error instanceof Error ? error.message : 'Unknown error'))
+      setAiError('Analisis otomatis gagal: ' + (error instanceof Error ? error.message : 'Unknown error'))
     } finally {
       setAiBusy(false)
     }
+  }
+
+  async function analyzeWithLocalAI() {
+    if (!selectedStory?.content.trim()) { setAiError('Pilih novel yang sudah diimpor terlebih dahulu.'); return }
+    if (!selectedAiModel) { setAiError('Hubungkan Ollama dan pasang model lokal terlebih dahulu.'); return }
+    const existingStyle = styles.find((style) => style.preview)
+    const pending: PendingAutoBuild = {
+      story: selectedStory,
+      referenceImage: existingStyle?.preview ?? '',
+      referenceName: existingStyle?.fileName ?? '',
+      styleId: existingStyle?.id ?? '',
+    }
+    await runAutoBuild(pending, selectedAiModel)
   }
 
   function saveAnalysisSynopsis() {
@@ -266,7 +461,7 @@ export default function App() {
 
         {page === 'My Stories' && <section className="workspace-page">
           <PageIntro eyebrow="YOUR LIBRARY" title="My stories" description="Every great manhwa begins with a story worth telling." action={<button className="primary-button" onClick={() => setModal('story')}><Plus size={17} /> New story</button>} />
-          <div className="import-banner"><div className="import-icon"><Upload size={19} /></div><div className="import-copy"><strong>Have a novel ready?</strong><span>Import a plain text or Markdown file. Your draft stays on this device.</span></div><label className="outline-button">Import novel <input type="file" accept=".txt,.md,text/plain,text/markdown" onChange={importNovel} hidden /></label></div>
+          <div className="import-banner auto-import-banner"><div className="import-icon"><WandSparkles size={19} /></div><div className="import-copy"><strong>One upload. Your project, mapped automatically.</strong><span>Choose a DOCX with an embedded art reference, or select a novel and image together. AI builds the story map, character bible, art direction, and storyboard.</span></div><label className={'primary-button auto-import-button ' + (importBusy ? 'is-loading' : '')}>{importBusy ? <LoaderCircle size={15} className="spin" /> : <Upload size={15} />}{importBusy ? 'Importing…' : 'Upload & auto-build'}<input type="file" accept=".docx,.txt,.md,image/*" multiple onChange={importNovel} hidden disabled={importBusy} /></label></div>
           {filteredStories.length ? <div className="story-grid">{filteredStories.map((story, index) => <button className="story-card" key={story.id} onClick={() => { setSelectedStoryId(story.id); setNotice('Selected ' + story.title + '.') }}><div className={'story-cover cover-' + (index % 4)}><span className="cover-index">STORY / {String(index + 1).padStart(3, '0')}</span><div className="cover-orbit" /><div className="cover-glyph">✳</div><span className="cover-bottom">MANHWA STUDIO</span></div><div className="story-card-info"><div><h3>{story.title}</h3><p>{story.synopsis || 'No synopsis yet.'}</p></div><MoreHorizontal size={17} className="muted-icon" /></div><div className="story-card-meta"><span><FileText size={13} /> {story.content ? story.content.trim().split(/\s+/).length.toLocaleString() + ' words' : 'Blank story'}</span><span><Clock3 size={13} /> {new Date(story.createdAt).toLocaleDateString()}</span></div></button>)}</div> : <EmptyState icon={BookOpen} title={searchQuery ? 'No stories found' : 'A blank page is full of possibility'} text={searchQuery ? 'Try a different title or clear your search.' : 'Create a story from scratch or import your novel to make this space yours.'} actionLabel={searchQuery ? 'Clear search' : 'Create your first story'} onAction={() => searchQuery ? setSearchQuery('') : setModal('story')} />}
           {selectedStory && <div className="selected-story-panel"><div className="selected-story-top"><div><div className="eyebrow">CURRENTLY SELECTED</div><h3>{selectedStory.title}</h3></div><span className="status-badge"><span /> IN YOUR WORKSPACE</span></div><p>{selectedStory.synopsis || 'Add a synopsis when you are ready. Your original text is stored locally in this browser.'}</p><div className="selected-story-actions"><button className="outline-button" onClick={() => go('Storyboard')}>Open storyboard <ArrowRight size={14} /></button><button className="text-button danger-text" onClick={() => { if (window.confirm('Delete this story and its local draft?')) { setStories((items) => items.filter((item) => item.id !== selectedStory.id)); setScenes((items) => items.filter((item) => item.storyId !== selectedStory.id)); setNotice('Story deleted from this browser.') } }}>Delete story</button></div></div>}
         </section>}
@@ -278,26 +473,28 @@ export default function App() {
         {page === 'Storyboard' && <section className="workspace-page"><PageIntro eyebrow="PRODUCTION WORKSPACE" title="Storyboard" description="Break the story into scenes and plan the emotional rhythm of each episode." action={<button className="primary-button" onClick={() => setModal('scene')}><Plus size={17} /> Add scene</button>} /><div className="storyboard-toolbar"><div className="select-wrap"><BookOpen size={15} /><select value={selectedStory?.id ?? ''} onChange={(event) => setSelectedStoryId(event.target.value)}><option value="">Select a story</option>{stories.map((story) => <option value={story.id} key={story.id}>{story.title}</option>)}</select><ChevronDown size={14} /></div><button className="outline-button" onClick={splitIntoScenes}><WandSparkles size={15} /> Split text into scene drafts</button></div><div className="local-note"><Zap size={14} /><span>This first-pass splitter works locally on paragraph breaks. It does not call an AI model.</span></div>{scenes.filter((scene) => !selectedStory || scene.storyId === selectedStory.id).length ? <div className="scene-list">{scenes.filter((scene) => !selectedStory || scene.storyId === selectedStory.id).map((scene, index) => <button className={'scene-row ' + (selectedScene?.id === scene.id ? 'scene-selected' : '')} key={scene.id} onClick={() => setSelectedSceneId(scene.id)}><div className="scene-index">{String(index + 1).padStart(2, '0')}</div><div className="scene-main"><div className="scene-title-line"><h3>{scene.title}</h3><span className="draft-tag">{scene.status}</span></div><p>{scene.description || 'Add a short description to capture what happens in this scene.'}</p><span className="scene-meta"><Clock3 size={12} /> Scene draft · {scene.description.length.toLocaleString()} characters</span></div><ChevronRight size={17} className="muted-icon" /></button>)}</div> : <EmptyState icon={Clapperboard} title="Your first scene is waiting" text="Choose a story, then add a scene or split your imported text into local scene drafts." actionLabel="Add a scene" onAction={() => setModal('scene')} />}</section>}
 
         {page === 'AI Studio' && <section className="workspace-page">
-          <PageIntro eyebrow="LOCAL INTELLIGENCE" title="Novel intelligence" description="Let a model running on your own machine help map the story before it becomes a manhwa." action={<button className="outline-button" onClick={connectLocalAI} disabled={aiStatus === 'checking'}>{aiStatus === 'checking' ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />} {aiStatus === 'checking' ? 'Checking...' : 'Check connection'}</button>} />
-          <div className="ai-status-card"><div className="ai-status-mark"><Cpu size={20} /></div><div className="ai-status-copy"><strong>Ollama local runtime</strong><span>Model berjalan di perangkat kamu. Tidak membutuhkan API key atau layanan AI berbayar.</span></div><div className="ai-status-state"><span className={'ai-status-light ' + aiStatus} />{aiStatus === 'connected' ? (aiModels.length ? 'CONNECTED · ' + aiModels.length + ' MODEL' : 'ONLINE · NO MODEL') : aiStatus === 'checking' ? 'CHECKING' : aiStatus === 'offline' ? 'OFFLINE' : 'NOT CHECKED'}</div></div>
+          <PageIntro eyebrow="LOCAL INTELLIGENCE" title="Your story, mapped by AI" description="Upload one document. The local AI automatically builds your story map, characters, visual direction, and storyboard." action={<div className="ai-header-actions"><button className="outline-button" onClick={connectLocalAI} disabled={aiStatus === 'checking' || modelPulling}>{aiStatus === 'checking' ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />} {aiStatus === 'checking' ? 'Checking...' : 'Check connection'}</button>{pendingAutoBuild && (!pendingAutoBuild.referenceImage || !aiModels.some(isVisionModel)) && <button className="primary-button" onClick={installRecommendedModel} disabled={modelPulling || aiStatus !== 'connected'}>{modelPulling ? <LoaderCircle size={15} className="spin" /> : <Cpu size={15} />}{modelPulling ? 'Installing…' : 'Install AI engine'}</button>}</div>} />
+          <div className="ai-status-card"><div className="ai-status-mark"><Cpu size={20} /></div><div className="ai-status-copy"><strong>Ollama local runtime</strong><span>AI berjalan di laptop kamu. Tidak memakai API key atau layanan cloud berbayar.</span></div><div className="ai-status-state"><span className={'ai-status-light ' + aiStatus} />{aiStatus === 'connected' ? (aiModels.length ? 'CONNECTED · ' + aiModels.length + ' MODEL' : 'ONLINE · NO MODEL') : aiStatus === 'checking' ? 'CHECKING' : aiStatus === 'offline' ? 'OFFLINE' : 'NOT CHECKED'}</div></div>
+          {(modelPulling || setupProgress) && <div className="ai-progress-note"><LoaderCircle size={14} className={modelPulling || aiBusy ? 'spin' : ''} /><span>{setupProgress}</span></div>}
           {aiError && <div className="ai-error"><X size={14} /><span>{aiError}</span></div>}
           <div className="ai-workspace-grid">
             <div className="panel-card ai-input-card"><div className="card-heading"><div><h3>Choose your novel</h3><p>Select an imported story and a local model.</p></div><span className="ai-local-tag">PRIVATE · LOCAL</span></div>
               <label className="ai-field">Story<select className="ai-select" value={selectedStory?.id ?? ''} onChange={(event) => { setSelectedStoryId(event.target.value); setAiAnalysis(null) }}><option value="">Select a story</option>{stories.map((story) => <option key={story.id} value={story.id}>{story.title}</option>)}</select></label>
               <label className="ai-field">Local model<select className="ai-select" value={selectedAiModel} onChange={(event) => setSelectedAiModel(event.target.value)} disabled={!aiModels.length}><option value="">{aiModels.length ? 'Choose a model' : 'No model detected — check connection'}</option>{aiModels.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>
-              <div className="ai-source-preview"><div><span>TEXT SOURCE</span><span>{selectedStory?.content ? selectedStory.content.trim().split(/\s+/).filter(Boolean).length.toLocaleString() + ' WORDS' : 'NO TEXT'}</span></div><p>{selectedStory?.content.trim() ? selectedStory.content.slice(0, 420) + (selectedStory.content.length > 420 ? '…' : '') : 'Import a .txt or .md novel from My Stories. The local model will analyze the text you select here.'}</p></div>
+              <div className="ai-source-preview"><div><span>TEXT SOURCE</span><span>{selectedStory?.content ? selectedStory.content.trim().split(/\s+/).filter(Boolean).length.toLocaleString() + ' WORDS' : 'NO TEXT'}</span></div><p>{selectedStory?.content.trim() ? selectedStory.content.slice(0, 420) + (selectedStory.content.length > 420 ? '…' : '') : 'Import a DOCX, TXT, or MD file from My Stories. The AI will map it automatically.'}</p></div>
+              {pendingAutoBuild?.referenceImage && <div className="ai-reference-preview"><img src={pendingAutoBuild.referenceImage} alt="Imported art style reference" /><div><strong>Art reference detected</strong><span>{pendingAutoBuild.referenceName || 'Image embedded in document'}</span></div></div>}
               <button className="primary-button ai-run-button" onClick={analyzeWithLocalAI} disabled={!selectedStory?.content.trim() || !selectedAiModel || aiBusy}>{aiBusy ? <LoaderCircle size={16} className="spin" /> : <WandSparkles size={16} />}{aiBusy ? 'Analyzing locally...' : 'Analyze novel'}</button>
               <p className="ai-privacy-note"><Cloud size={13} /> Text is sent only to the Ollama service running on this computer.</p>
               {!stories.length && <button className="text-button ai-go-stories" onClick={() => go('My Stories')}>Go to My Stories <ArrowRight size={14} /></button>}
             </div>
             <div className="panel-card ai-results-card"><div className="card-heading"><div><h3>Story intelligence</h3><p>Review the model's suggestions before saving them.</p></div>{aiAnalysis?.storyId === selectedStory?.id && <span className="ai-result-tag">ANALYSIS READY</span>}</div>
               {aiAnalysis && aiAnalysis.storyId === selectedStory?.id ? <div className="ai-results-content">
-                <div className="ai-summary-top"><span className="ai-result-label">GENRE</span><strong>{aiAnalysis.genre || 'Not identified'}</strong><div className="ai-logline">{aiAnalysis.logline || 'No logline returned.'}</div></div>
-                <div className="ai-analysis-block"><div className="ai-block-heading"><h4>Synopsis</h4><button className="subtle-action" onClick={saveAnalysisSynopsis}>Save to story <Check size={13} /></button></div><p>{aiAnalysis.synopsis || 'The model did not return a synopsis.'}</p></div>
+                <div className="ai-summary-top"><span className="ai-result-label">GENRE</span><strong>{aiAnalysis.genre || 'Not identified'}</strong><div className="ai-logline">{aiAnalysis.logline || 'No logline returned.'}</div><span className="ai-auto-saved"><Check size={11} /> AUTO-SAVED TO PROJECT</span></div>
+                <div className="ai-analysis-block"><div className="ai-block-heading"><h4>Synopsis</h4><span className="ai-auto-saved"><Check size={11} /> SAVED</span></div><p>{aiAnalysis.synopsis || 'The model did not return a synopsis.'}</p></div>
                 <div className="ai-analysis-block"><h4>Core themes</h4><div className="ai-theme-list">{aiAnalysis.themes.length ? aiAnalysis.themes.map((theme, index) => <span className="ai-theme-chip" key={theme + index}>{theme}</span>) : <span className="ai-muted">No themes returned.</span>}</div></div>
-                <div className="ai-analysis-block"><div className="ai-block-heading"><h4>Character candidates <span>{aiAnalysis.characters.length}</span></h4><button className="subtle-action" onClick={saveAnalysisCharacters}>Add to bible <Plus size={13} /></button></div>{aiAnalysis.characters.length ? <div className="ai-character-list">{aiAnalysis.characters.map((character) => <div className="ai-character-row" key={character.name}><div className="ai-character-avatar">{character.name.slice(0, 1).toUpperCase()}</div><div><strong>{character.name}</strong><span>{character.role}</span><p>{character.description}</p></div></div>)}</div> : <span className="ai-muted">No character candidates returned.</span>}</div>
-                <div className="ai-analysis-block"><div className="ai-block-heading"><h4>Scene breakdown <span>{aiAnalysis.scenes.length}</span></h4><button className="subtle-action" onClick={saveAnalysisScenes} disabled={!aiAnalysis.scenes.length}>Add to storyboard <ArrowRight size={13} /></button></div>{aiAnalysis.scenes.length ? <div className="ai-scene-list">{aiAnalysis.scenes.map((scene, index) => <div className="ai-scene-row" key={scene.title + index}><span>{String(index + 1).padStart(2, '0')}</span><div><strong>{scene.title}</strong><p>{scene.summary}</p></div></div>)}</div> : <span className="ai-muted">No scenes returned.</span>}</div>
-              </div> : <div className="ai-empty-results"><div className="ai-empty-icon"><Sparkles size={23} /></div><h3>Your story, understood.</h3><p>Connect Ollama, select a novel and model, then run your first local analysis. Results will appear here.</p></div>}
+                <div className="ai-analysis-block"><div className="ai-block-heading"><h4>Character Bible <span>{aiAnalysis.characters.length}</span></h4><span className="ai-auto-saved"><Check size={11} /> SAVED</span></div>{aiAnalysis.characters.length ? <div className="ai-character-list">{aiAnalysis.characters.map((character) => <div className="ai-character-row" key={character.name}><div className="ai-character-avatar">{character.name.slice(0, 1).toUpperCase()}</div><div><strong>{character.name}</strong><span>{character.role}</span><p>{character.description}</p></div></div>)}</div> : <span className="ai-muted">No character candidates returned.</span>}</div>
+                <div className="ai-analysis-block"><div className="ai-block-heading"><h4>Storyboard <span>{aiAnalysis.scenes.length}</span></h4><span className="ai-auto-saved"><Check size={11} /> SAVED</span></div>{aiAnalysis.scenes.length ? <div className="ai-scene-list">{aiAnalysis.scenes.map((scene, index) => <div className="ai-scene-row" key={scene.title + index}><span>{String(index + 1).padStart(2, '0')}</span><div><strong>{scene.title}</strong><p>{scene.summary}</p></div></div>)}</div> : <span className="ai-muted">No scenes returned.</span>}</div>
+              </div> : <div className="ai-empty-results"><div className="ai-empty-icon"><Sparkles size={23} /></div><h3>Your story, understood.</h3><p>Upload one DOCX, TXT, or MD file. Add an image reference in the same selection or embed it in the DOCX. The AI will build the project automatically.</p>{pendingAutoBuild && pendingAutoBuild.referenceImage && !aiModels.some(isVisionModel) && <p className="ai-model-hint">One-time setup: install the local vision model to let AI understand the reference image.</p>}</div>}
             </div>
           </div>
         </section>}
