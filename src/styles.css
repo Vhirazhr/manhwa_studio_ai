@@ -68,3 +68,21 @@ button:disabled{opacity:.48;cursor:not-allowed;transform:none!important;box-shad
 .ai-empty-results h3{margin:6px 0;color:#f0e7ef;font:700 14px 'Manrope',sans-serif}.ai-empty-results p{max-width:280px;margin:0;color:#897f8c;font-size:9px;line-height:1.7}
 @media(max-width:1050px){.ai-workspace-grid{grid-template-columns:1fr}.ai-input-card{position:static}}
 @media(max-width:600px){.ai-status-card{align-items:flex-start;flex-wrap:wrap}.ai-status-state{margin-left:52px}.ai-block-heading{align-items:flex-start}.ai-block-heading .subtle-action{font-size:8px}}
+
+
+/* One-upload automatic project creation */
+.auto-import-banner{align-items:center;gap:14px;padding:17px 18px}
+.auto-import-banner .import-copy{flex:1;min-width:180px}
+.auto-import-banner .import-copy strong{display:block;color:#f4e9f0;font-size:11px;margin-bottom:5px}
+.auto-import-banner .import-copy span{display:block;color:#978b98;font-size:9px;line-height:1.6;max-width:640px}
+.auto-import-button{white-space:nowrap;display:inline-flex;align-items:center;gap:8px}
+.auto-import-button input{display:none}
+.ai-header-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.ai-progress-note{display:flex;align-items:center;gap:9px;padding:10px 12px;margin-bottom:13px;border:1px solid rgba(255,92,154,.18);border-radius:8px;color:#ffc1d8;background:rgba(255,92,154,.06);font-size:9px}
+.ai-reference-preview{display:flex;align-items:center;gap:10px;padding:9px;margin-top:12px;border:1px solid rgba(255,92,154,.18);border-radius:8px;background:rgba(255,92,154,.045)}
+.ai-reference-preview img{width:48px;height:48px;object-fit:cover;border-radius:6px}
+.ai-reference-preview div{min-width:0;display:flex;flex-direction:column;gap:4px}
+.ai-reference-preview strong{color:#f2e8f0;font-size:9px}.ai-reference-preview span{color:#958995;font-size:8px;overflow-wrap:anywhere}
+.ai-auto-saved{display:inline-flex;align-items:center;gap:4px;color:#ff9fc2;font-size:7px;font-weight:700;letter-spacing:.55px;white-space:nowrap}
+.ai-model-hint{margin-top:10px!important;color:#ffc1d8!important}
+@media(max-width:700px){.auto-import-banner{align-items:flex-start;flex-wrap:wrap}.auto-import-button{margin-left:51px}.ai-header-actions{justify-content:flex-start}}
