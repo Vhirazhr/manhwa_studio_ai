@@ -399,27 +399,47 @@ export default function App() {
         'Maksimal 15 tokoh dan 20 adegan. Jika naskah terlalu panjang atau ada informasi yang belum jelas, tandai keterbatasannya daripada menebak.\n\n' + excerpt
       const userMessage: { role: 'user'; content: string; images?: string[] } = { role: 'user', content: prompt }
       if (pending.referenceImage) userMessage.images = [pending.referenceImage.split(',')[1] ?? pending.referenceImage]
-      const response = await fetch('/ollama/api/chat', {
+      const chatRequest = (cpuOnly = false) => ({
+        model,
+        stream: false,
+        format: 'json',
+        messages: [
+          { role: 'system', content: 'Anda adalah editor cerita, story analyst, character designer, dan sutradara storyboard untuk adaptasi manhwa. Kerjakan pemetaan secara mandiri berdasarkan naskah dan referensi visual. Jangan meminta user menulis prompt. Jangan mengarang fakta cerita.' },
+          userMessage,
+        ],
+        // Keep memory use modest on laptops; retry without GPU if CUDA cannot allocate its host buffer.
+        options: cpuOnly
+          ? { temperature: 0.25, num_ctx: 2048, num_batch: 64, num_gpu: 0 }
+          : { temperature: 0.25, num_ctx: 2048, num_batch: 128 },
+      })
+      let response = await fetch('/ollama/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model,
-          stream: false,
-          format: 'json',
-          messages: [
-            { role: 'system', content: 'Anda adalah editor cerita, story analyst, character designer, dan sutradara storyboard untuk adaptasi manhwa. Kerjakan pemetaan secara mandiri berdasarkan naskah dan referensi visual. Jangan meminta user menulis prompt. Jangan mengarang fakta cerita.' },
-            userMessage,
-          ],
-          options: { temperature: 0.25 },
-        }),
+        body: JSON.stringify(chatRequest(false)),
       })
-      const responseText = await response.text()
+      let responseText = await response.text()
+      let usedCpuFallback = false
+
+      // Some Windows/NVIDIA systems fail to allocate CUDA pinned host memory.
+      // Retry the same request on CPU so the user does not need to change settings manually.
+      if (!response.ok && /(CUDA_Host|CUDA.*buffer|unable to allocate|out of memory|llama-server startup failed)/i.test(responseText)) {
+        setSetupProgress('GPU mengalami kendala alokasi memori. Mencoba mode CPU otomatis…')
+        usedCpuFallback = true
+        response = await fetch('/ollama/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(chatRequest(true)),
+        })
+        responseText = await response.text()
+      }
+
       let payload: { message?: { content?: string }; error?: string } = {}
       try { payload = JSON.parse(responseText) as typeof payload } catch {
         if (!response.ok) throw new Error('Ollama HTTP ' + response.status + ': ' + responseText.slice(0, 700))
         throw new Error('Ollama mengirim respons yang bukan JSON: ' + responseText.slice(0, 300))
       }
       if (!response.ok) throw new Error(payload.error ?? 'Local model request failed with HTTP ' + response.status)
+      if (usedCpuFallback) setSetupProgress('Analisis berjalan dalam mode CPU karena alokasi memori GPU gagal.')
       const raw = (payload.message?.content ?? '').trim()
       if (!raw) throw new Error('Model mengembalikan jawaban kosong. Coba lagi atau gunakan naskah lebih pendek.')
       const cleaned = raw.replace(/^\`\`\`(?:json)?\s*/i, '').replace(/\s*\`\`\`$/, '')
@@ -467,10 +487,10 @@ export default function App() {
       setPendingAutoBuild(null)
       setSelectedStoryId(pending.story.id)
       setPage('AI Studio')
-      setNotice('Project otomatis selesai: sinopsis, Character Bible, referensi art style, dan ' + generatedScenes.length + ' scene storyboard sudah dibuat.')
+      setNotice('Project otomatis selesai: sinopsis, Character Bible, referensi art style, dan ' + generatedScenes.length + ' scene storyboard sudah dibuat.' + (usedCpuFallback ? ' (mode CPU)' : ''))
       setSetupProgress('Project siap. Semua hasil sudah disimpan ke workspace.')
     } catch (error) {
-      setAiError('Analisis otomatis gagal: ' + (error instanceof Error ? error.message : 'Unknown error'))
+      setAiError('Analisis otomatis gagal: ' + (error instanceof Error ? error.message : 'Unknown error') + '. Tutup aplikasi berat agar RAM tersedia, lalu coba Analyze novel lagi.')
     } finally {
       setAiBusy(false)
     }
