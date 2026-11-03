@@ -5,7 +5,8 @@ A personal, local-first workspace for developing a novel into a manhwa or webtoo
 ## Current foundation
 
 - Dark charcoal and pink creative-studio interface.
-- Story library with local TXT and Markdown import.
+- One-upload story import for DOCX/TXT/Markdown, including embedded or separately selected art-reference images.
+- Automatic local project mapping: synopsis, genre, themes, Character Bible, visual art direction, and storyboard scenes.
 - Character bible for cast notes.
 - Art direction reference library.
 - Storyboard scene drafts.
@@ -28,15 +29,15 @@ Requirements: Node.js 20 or newer.
 3. Start the development server with npm run dev.
 4. Open the local URL printed by Vite.
 
-### Optional: enable local AI analysis
+### One-time local AI setup
 
 1. Install and open [Ollama](https://ollama.com/download) on the same computer.
-2. In a terminal, download a small instruct model. For example: `ollama pull qwen2.5:3b`.
-3. Confirm that Ollama is running at `http://127.0.0.1:11434`.
-4. Open **AI Studio** in Manhwa Studio and click **Check connection**.
-5. Choose the installed model, select an imported novel, and click **Analyze novel**.
+2. Start Manhwa Studio with `npm run dev`.
+3. In **My Stories**, choose **Upload & auto-build** and select a DOCX (with an embedded art reference) or select a novel and image together.
+4. If a vision model is not installed, click **Install AI engine** once. Manhwa Studio downloads `qwen2.5vl:3b` through your local Ollama runtime.
+5. After setup, future uploads automatically analyze the story and visual reference and save the project map.
 
-The current analysis sends up to 24,000 characters to the selected local model (for longer files, it samples the beginning and end). It returns suggested genre, logline, synopsis, themes, character candidates, and scene breakdowns. Review the suggestions before saving them. This is a first-pass single-request analysis; chapter-by-chapter processing and stronger consistency checks are planned next.
+The first version analyzes up to 24,000 characters per upload (longer files are sampled at the beginning and end). It automatically creates the synopsis, genre/theme map, Character Bible, art-direction notes, and storyboard scene drafts. Chapter-by-chapter analysis for full-length novels is the next milestone. Everything runs through Ollama on your own machine; no paid API key is used.
 
 Build for production with npm run build.
 
