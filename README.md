@@ -5,7 +5,7 @@ A personal, local-first workspace for developing a novel into a manhwa or webtoo
 ## Current foundation
 
 - Dark charcoal and pink creative-studio interface.
-- One-upload story import for DOCX/TXT/Markdown, including embedded or separately selected art-reference images.
+- One-click story import from the Overview and My Stories pages. Supports ZIP bundles (DOCX/TXT/Markdown plus images), DOCX/TXT/Markdown files, and separately selected art-reference images.
 - Automatic local project mapping: synopsis, genre, themes, Character Bible, visual art direction, and storyboard scenes.
 - Character bible for cast notes.
 - Art direction reference library.
@@ -33,7 +33,7 @@ Requirements: Node.js 20 or newer.
 
 1. Install and open [Ollama](https://ollama.com/download) on the same computer.
 2. Start Manhwa Studio with `npm run dev`.
-3. In **My Stories**, choose **Upload & auto-build** and select a DOCX (with an embedded art reference) or select a novel and image together.
+3. From **Overview** or **My Stories**, click **Upload novel** / **Upload files**. You can select a ZIP bundle containing a DOCX/TXT/Markdown story and image, a DOCX with embedded images, or a novel and image together.
 4. If a vision model is not installed, click **Install AI engine** once. Manhwa Studio downloads `qwen2.5vl:3b` through your local Ollama runtime.
 5. After setup, future uploads automatically analyze the story and visual reference and save the project map.
 
